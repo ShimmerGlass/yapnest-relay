@@ -1,0 +1,57 @@
+# ejabberd for the integration test (integration_test.go): plaintext sign-in, no TLS.
+hosts:
+  - localhost
+
+loglevel: info
+
+listen:
+  - port: 5222
+    ip: "::"
+    module: ejabberd_c2s
+    max_stanza_size: 262144
+    shaper: c2s_shaper
+    access: c2s
+    starttls: false
+  - port: 5347
+    ip: "::"
+    module: ejabberd_service
+    access: all
+    hosts:
+      "push.localhost":
+        password: "relay"
+
+auth_method: internal
+auth_password_format: plain
+disable_sasl_mechanisms: []
+
+acl:
+  local:
+    user_regexp: ""
+
+access_rules:
+  local:
+    allow: local
+  c2s:
+    allow: all
+  announce:
+    allow: local
+  configure:
+    allow: local
+
+shaper:
+  normal:
+    rate: 3000
+    burst_size: 20000
+  fast: 100000
+
+shaper_rules:
+  c2s_shaper:
+    fast: all
+
+modules:
+  mod_adhoc: {}
+  mod_disco: {}
+  mod_offline: {}
+  mod_ping: {}
+  mod_push: {}
+  mod_roster: {}
