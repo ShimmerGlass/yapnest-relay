@@ -25,6 +25,9 @@ const (
 	// The ad-hoc command (XEP-0050) the app runs to get a node for its device token.
 	registerNode = "register-push-apns"
 	registerName = "Register an iOS device"
+
+	// The AGPL asks the relay to offer its source to whoever uses it over the network: disco#info names it.
+	sourceURL = "https://github.com/ShimmerGlass/yapnest-relay"
 )
 
 type pusher interface {
@@ -101,8 +104,15 @@ func (r *relay) handle(st stanza) {
 func (r *relay) discoInfo(st stanza, node string) {
 	switch node {
 	case "":
-		r.reply(st, newDiscoInfo("", identity{Category: "pubsub", Type: "push", Name: "Yapnest push relay"},
-			nsDiscoInfo, nsCommands, nsPush, nsPing))
+		q := newDiscoInfo("", identity{Category: "pubsub", Type: "push", Name: "Yapnest push relay"},
+			nsDiscoInfo, nsCommands, nsPush, nsPing)
+		// Software information (XEP-0232), with where to get the source.
+		q.Form = &dataForm{XMLName: xml.Name{Space: nsData, Local: "x"}, Type: "result", Fields: []formField{
+			{Var: "FORM_TYPE", Type: "hidden", Values: []string{"urn:xmpp:dataforms:softwareinfo"}},
+			{Var: "software", Values: []string{"yapnest-relay"}},
+			{Var: "source", Values: []string{sourceURL}},
+		}}
+		r.reply(st, q)
 	case registerNode:
 		r.reply(st, newDiscoInfo(registerNode, identity{Category: "automation", Type: "command-node", Name: registerName},
 			nsCommands, nsData))
@@ -138,6 +148,7 @@ type discoInfo struct {
 	Node     string    `xml:"node,attr,omitempty"`
 	Identity identity  `xml:"identity"`
 	Features []feature `xml:"feature"`
+	Form     *dataForm `xml:"x"` // extended information (XEP-0128)
 }
 
 func newDiscoInfo(node string, id identity, features ...string) *discoInfo {

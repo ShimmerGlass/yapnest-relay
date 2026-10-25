@@ -2,7 +2,7 @@
 
 Yapnest's push relay: the XEP-0357 app server that wakes the iOS app when a message arrives. It connects to an
 XMPP server as an external component (XEP-0114) and serves a domain, say `push.yapnest.fr`. Every user's server
-reaches it over s2s, whichever server they're on.
+reaches it over s2s, whichever server they're on. Its source is at <https://github.com/ShimmerGlass/yapnest-relay>.
 
 1. **Register:** the app runs the `register-push-apns` ad-hoc command (XEP-0050) on the relay, with its APNs
    device token. It gets a **node** back.
@@ -154,4 +154,5 @@ RELAY_KEY=$(head -c32 /dev/urandom | base64) APNS_KEY_ID=… APNS_TEAM_ID=… AP
 
 yapnest-relay is free software under the GNU Affero General Public License, version 3 or later (`NOTICE`, with
 the licence's text in `LICENSE`), like the Yapnest app it serves. The Go modules it's built on keep their own
-licences, listed in `go.mod`.
+licences, listed in `go.mod`. As the licence asks of a network service, the relay names where its source is in its
+disco#info reply (XEP-0232 software information, field `source`); a modified relay must point it at its own source.
