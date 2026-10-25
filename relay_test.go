@@ -280,7 +280,7 @@ func TestEndToEnd(t *testing.T) {
 	go c.run(ctx)
 
 	info := server.exchange(`<iq type='get' id='d1' from='alice@example.org/phone' to='push.example'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>`)
-	if info.Type != "result" || !strings.Contains(string(info.Inner), "urn:xmpp:push:0") {
+	if info.Type != "result" || !strings.Contains(string(info.Inner), "urn:xmpp:push:0") || !strings.Contains(string(info.Inner), sourceURL) {
 		t.Fatalf("disco: %+v %s", info, info.Inner)
 	}
 
