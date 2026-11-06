@@ -80,6 +80,7 @@ Unset, it opens no listener. Each replica has its own numbers: scrape both and s
 |---|---|---|
 | `yapnest_relay_registrations_total` | `environment` (`sandbox`, `production`, `unknown` when the form named none of them), `result` (`ok`, `bad_token`, `bad_form`) | registrations |
 | `yapnest_relay_publishes_total` | `result` (see below) | publishes from users' servers |
+| `yapnest_relay_publish_summaries_total` | `summary` (`body`, `no_body` for a form without one, `none` for no form) | publishes from the node's owner by what their summary has; only whether there is a body is read |
 | `yapnest_relay_apns_requests_total` | `environment`, `outcome` (`ok`, `bad_request`, `forbidden`, `gone`, `too_many`, `server_error`, `network_error`) | requests to APNs. A dead token is `gone`, whichever status Apple used |
 | `yapnest_relay_apns_request_duration_seconds` | `environment` | histogram of those requests, failed ones included |
 | `yapnest_relay_component_connected` | | 1 while connected, else 0 |

@@ -272,12 +272,14 @@ func (r *relay) register(st stanza) {
 	r.reply(st, c)
 }
 
-// publish is a notification from a user's server: it becomes an alert on the device the node names. The
-// notification's summary (sender, body) is ignored, so none of it reaches Apple.
+// publish is a notification from a user's server: it becomes an alert on the device the node names. Of the
+// notification's summary (sender, body), only whether it has a body is looked at, to count it: none of it reaches
+// Apple.
 func (r *relay) publish(st stanza) {
 	var ps struct {
 		Publish struct {
-			Node string `xml:"node,attr"`
+			Node    string    `xml:"node,attr"`
+			Summary *dataForm `xml:"item>notification>x"`
 		} `xml:"publish"`
 	}
 	if err := xml.Unmarshal(st.Inner, &ps); err != nil || ps.Publish.Node == "" {
@@ -300,6 +302,7 @@ func (r *relay) publish(st stanza) {
 		return
 	}
 
+	r.metrics.publishSummary(summaryKind(ps.Publish.Summary))
 	node := ps.Publish.Node
 	if !r.schedule(node, reg) {
 		// A push is already on its way, or comes at the window's end; that one is counted when it goes out.
@@ -312,6 +315,20 @@ func (r *relay) publish(st stanza) {
 		return
 	}
 	r.reply(st, nil)
+}
+
+// summaryKind says what a publish's summary shows about what it announces. Servers differ: ejabberd sends no form
+// for what has no body, Prosody a form without one for what it doesn't count as important.
+func summaryKind(form *dataForm) string {
+	if form == nil {
+		return "none"
+	}
+	for _, field := range form.Fields {
+		if field.Var == "last-message-body" && len(field.Values) > 0 && field.Values[0] != "" {
+			return "body"
+		}
+	}
+	return "no_body"
 }
 
 // pushed pushes for reg, counts and logs how it went, and returns the reply for the publish behind it. A dead

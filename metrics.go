@@ -31,6 +31,7 @@ var (
 	environments        = []string{"sandbox", "production"}
 	registrationResults = []string{"ok", "bad_token", "bad_form"}
 	publishResults      = []string{"sent", "coalesced", "trailing", "unauthorized", "bad_node", "gone", "error"}
+	publishSummaries    = []string{"body", "no_body", "none"}
 	apnsOutcomes        = []string{"ok", "bad_request", "forbidden", "gone", "too_many", "server_error", "network_error"}
 	connectResults      = []string{"ok", "error"}
 )
@@ -41,6 +42,7 @@ type metrics struct {
 	reg           *prometheus.Registry
 	registrations *prometheus.CounterVec
 	publishes     *prometheus.CounterVec
+	summaries     *prometheus.CounterVec
 	apnsRequests  *prometheus.CounterVec
 	apnsDuration  *prometheus.HistogramVec
 	connects      *prometheus.CounterVec
@@ -61,6 +63,10 @@ func newMetrics() *metrics {
 			Name: "yapnest_relay_publishes_total",
 			Help: "Publishes from users' servers by result. Coalesced ones were absorbed by a push in the window; trailing counts the pushes sent at the end of one.",
 		}, []string{"result"}),
+		summaries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "yapnest_relay_publish_summaries_total",
+			Help: "Publishes from the node's owner by what their summary has: a body, a form without one, or no form.",
+		}, []string{"summary"}),
 		apnsRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "yapnest_relay_apns_requests_total",
 			Help: "Requests to APNs by environment and outcome.",
@@ -93,6 +99,9 @@ func newMetrics() *metrics {
 	for _, result := range publishResults {
 		m.publishes.WithLabelValues(result)
 	}
+	for _, summary := range publishSummaries {
+		m.summaries.WithLabelValues(summary)
+	}
 	for _, env := range environments {
 		for _, outcome := range apnsOutcomes {
 			m.apnsRequests.WithLabelValues(env, outcome)
@@ -123,7 +132,7 @@ func newMetrics() *metrics {
 	})
 	buildInfo.Set(1)
 
-	m.reg.MustRegister(m.registrations, m.publishes, m.apnsRequests, m.apnsDuration, m.connects, connectedGauge, buildInfo,
+	m.reg.MustRegister(m.registrations, m.publishes, m.summaries, m.apnsRequests, m.apnsDuration, m.connects, connectedGauge, buildInfo,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
 }
@@ -154,6 +163,12 @@ func (m *metrics) registration(env, result string) {
 func (m *metrics) publish(result string) {
 	if m != nil {
 		m.publishes.WithLabelValues(result).Inc()
+	}
+}
+
+func (m *metrics) publishSummary(kind string) {
+	if m != nil {
+		m.summaries.WithLabelValues(kind).Inc()
 	}
 }
 

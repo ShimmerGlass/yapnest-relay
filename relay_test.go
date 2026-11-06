@@ -337,6 +337,7 @@ func TestEndToEnd(t *testing.T) {
 	fake.mu.Unlock()
 	expect(t, prom, 1, "yapnest_relay_publishes_total", "result", "sent")
 	expect(t, prom, 1, "yapnest_relay_apns_requests_total", "environment", "sandbox", "outcome", "ok")
+	expect(t, prom, 1, "yapnest_relay_publish_summaries_total", "summary", "body")
 	if n := histogramCount(t, prom, "yapnest_relay_apns_request_duration_seconds", "environment", "sandbox"); n != 1 {
 		t.Fatalf("%d timed requests", n)
 	}
@@ -354,6 +355,8 @@ func TestEndToEnd(t *testing.T) {
 	}
 	expect(t, prom, 2, "yapnest_relay_publishes_total", "result", "sent")
 	expect(t, prom, 1, "yapnest_relay_publishes_total", "result", "unauthorized")
+	// Only the node's owner is counted, as a stranger's publish says nothing about what arrived.
+	expect(t, prom, 2, "yapnest_relay_publish_summaries_total", "summary", "body")
 	expect(t, prom, 1, "yapnest_relay_publishes_total", "result", "bad_node")
 
 	// A removed app: the server should drop the target.
@@ -900,5 +903,36 @@ func TestErrorAndResultReplies(t *testing.T) {
 	}
 	if success.Type != "result" || success.Error != nil {
 		t.Fatalf("result reply %s", sent[1])
+	}
+}
+
+// A summary is only counted by whether it has a body, and each server leaves it out in its own way.
+func TestPublishSummariesAreCountedByWhatTheyHave(t *testing.T) {
+	publish := func(notification string) string {
+		var ps struct {
+			Publish struct {
+				Summary *dataForm `xml:"item>notification>x"`
+			} `xml:"publish"`
+		}
+		wrapped := fmt.Sprintf(`<pubsub xmlns='http://jabber.org/protocol/pubsub'><publish node='n'><item>%s</item></publish></pubsub>`, notification)
+		if err := xml.Unmarshal([]byte(wrapped), &ps); err != nil {
+			t.Fatal(err)
+		}
+		return summaryKind(ps.Publish.Summary)
+	}
+	form := func(fields string) string {
+		return fmt.Sprintf(`<notification xmlns='urn:xmpp:push:0'><x xmlns='%s' type='submit'>%s</x></notification>`, nsData, fields)
+	}
+	for name, test := range map[string]struct{ notification, want string }{
+		"a message":                    {form(`<field var='message-count'><value>1</value></field><field var='last-message-body'><value>New Message!</value></field>`), "body"},
+		"Prosody's unimportant":        {form(`<field var='message-count'><value>1</value></field>`), "no_body"},
+		"a body with nothing in it":    {form(`<field var='last-message-body'><value></value></field>`), "no_body"},
+		"only a sender":                {form(`<field var='last-message-sender'><value>a@b</value></field>`), "no_body"},
+		"ejabberd's without a body":    {`<notification xmlns='urn:xmpp:push:0'/>`, "none"},
+		"ejabberd's push_notification": {`<push_notification xmlns='urn:xmpp:push:0'/>`, "none"},
+	} {
+		if got := publish(test.notification); got != test.want {
+			t.Errorf("%s: %q, not %q", name, got, test.want)
+		}
 	}
 }
