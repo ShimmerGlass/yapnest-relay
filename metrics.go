@@ -30,7 +30,7 @@ var buildRevision string
 var (
 	environments        = []string{"sandbox", "production"}
 	registrationResults = []string{"ok", "bad_token", "bad_form"}
-	publishResults      = []string{"sent", "coalesced", "trailing", "unauthorized", "bad_node", "gone", "error"}
+	publishResults      = []string{"sent", "coalesced", "trailing", "background", "background_coalesced", "unauthorized", "bad_node", "gone", "error"}
 	publishSummaries    = []string{"body", "no_body", "none"}
 	apnsOutcomes        = []string{"ok", "bad_request", "forbidden", "gone", "too_many", "server_error", "network_error"}
 	connectResults      = []string{"ok", "error"}
@@ -61,7 +61,7 @@ func newMetrics() *metrics {
 		}, []string{"environment", "result"}),
 		publishes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "yapnest_relay_publishes_total",
-			Help: "Publishes from users' servers by result. Coalesced ones were absorbed by a push in the window; trailing counts the pushes sent at the end of one.",
+			Help: "Publishes from users' servers by result. Coalesced ones were absorbed by a push in the window; trailing counts the pushes sent at the end of one; background ones are silent pushes for publishes without a body, and background_coalesced the extras dropped in their own window.",
 		}, []string{"result"}),
 		summaries: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "yapnest_relay_publish_summaries_total",

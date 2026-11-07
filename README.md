@@ -10,7 +10,10 @@ reaches it over s2s, whichever server they're on. Its source is at <https://gith
    node='…'/>`).
 3. **Publish:** when a message arrives while the app is away, the user's server publishes to that node. The relay
    sends Apple a content-free alert with `mutable-content`. That wakes the app's notification service extension,
-   which fetches the message, decrypts it and shows it.
+   which fetches the message, decrypts it and shows it. Prosody marks what it doesn't count as important
+   (presence, receipts, chat states) with a summary that has no body: those get a silent background push
+   (`content-available`, no alert) instead, so they don't show a notification, but only once that node has published a
+   summary with a body since the relay started (see [Bursts](#bursts)).
 
 Nothing about a message reaches Apple. The summary some servers include (sender, body) is dropped.
 
@@ -33,6 +36,16 @@ Servers publish for more than messages: ejabberd's default (`notify_on: all`) pu
 events too. Each push wakes the app's extension, which catches up on everything, so the relay sends at most one
 push per device every 10 seconds. A publish inside that window gets one trailing push at its end, so the last
 message of a burst still wakes the app. On ejabberd, `mod_push: {notify_on: messages}` avoids most of them.
+
+Background pushes have a window of their own and don't touch the alert one: a call right after presence is
+pushed at once. A device gets at most one background push per window; the others are dropped, with no trailing
+push, as nothing urgent is in them and iOS throttles them anyway. They expire at once rather than being kept for
+an offline phone. Only a summary with a form but no body is quiet: ejabberd sends no form for anything without a
+body, calls included, so those keep alerting. Even then, a node's bodiless publish stays an alert, with its window
+and trailing push, until that node has sent one with a body since the relay started. That proves its server
+marks important stanzas: Prosody with `push_notification_important_body` empty, or a server that leaves the body
+out for privacy, sends every message and call without one. The relay remembers this in memory only, for a bounded
+number of nodes and forgets all of it past that, so after a restart devices alert until their first real message.
 
 Changing `RELAY_KEY` invalidates every node. Apps register on every launch, so they recover on their own.
 
@@ -85,10 +98,10 @@ Unset, it opens no listener. Each replica has its own numbers: scrape both and s
 | `yapnest_relay_apns_request_duration_seconds` | `environment` | histogram of those requests, failed ones included |
 | `yapnest_relay_component_connected` | | 1 while connected, else 0 |
 | `yapnest_relay_component_connects_total` | `result` (`ok`, `error`) | attempts to connect |
-| `yapnest_relay_throttled_devices` | | devices inside their 10 s window or with a trailing push pending |
+| `yapnest_relay_throttled_devices` | | devices inside their 10 s window (alert or background) or with a trailing push pending |
 | `yapnest_relay_build_info` | `version`, `revision` | always 1. The image build sets both; each is `unknown` when neither the build nor the binary's VCS info provides it |
 
-The publish results: `sent` went to APNs at once; `coalesced` was absorbed by a push already sent or pending in
+The publish results: `sent` went to APNs at once as an alert; `background` went at once as a silent push, for a summary without a body; `background_coalesced` was dropped because the device had a background push in the last window; `coalesced` was absorbed by a push already sent or pending in
 its window, so it has none of its own; `trailing` is a push sent at the end of a window; `unauthorized` came from
 someone other than the node's account or server; `bad_node` named no valid node; `gone` is a token APNs says is dead,
 answered `item-not-found` (for a trailing push, the server's next publish is pushed at once and gets that answer);

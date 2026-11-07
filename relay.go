@@ -31,7 +31,7 @@ const (
 )
 
 type pusher interface {
-	push(context.Context, registration) error
+	push(ctx context.Context, reg registration, background bool) error
 }
 
 // relay is the XEP-0357 app server: devices register their APNs token and get a node back, then hand the node
@@ -49,9 +49,12 @@ type relay struct {
 	mu        sync.Mutex
 	recent    map[string]*throttle // by node
 	lastSweep time.Time            // when recent last dropped its idle entries
-	draining  bool                 // drain has started: nothing waits for a window any more
-	busy      int                  // the pushes schedule promised, at once or trailing, and not finished
-	idle      chan struct{}        // closed when busy drops to 0, while drain waits for it
+	vouched   map[string]bool      // nodes whose server has sent a body publish since the relay started
+	// vouchedLimit is how many nodes vouched holds; 0 for maxVouched.
+	vouchedLimit int
+	draining     bool          // drain has started: nothing waits for a window any more
+	busy         int           // the pushes schedule promised, at once or trailing, and not finished
+	idle         chan struct{} // closed when busy drops to 0, while drain waits for it
 }
 
 // Servers publish for more than messages (ejabberd's default pushes for presence and PEP events too), so
@@ -59,14 +62,23 @@ type relay struct {
 // window is enough, as long as the last publish of a burst still gets one.
 const pushWindow = 10 * time.Second
 
+// A publish Prosody didn't count as important (presence, receipts, chat states) only needs the app to catch up,
+// quietly. Those pushes are limited apart from alerts, so they neither delay one (a call right after presence is
+// pushed at once) nor get a trailing push: nothing urgent is in them, and iOS throttles background pushes anyway.
+// maxVouched bounds the nodes remembered to have sent a body. Past it everything is forgotten, so devices alert
+// again until their next real message: that fails loud, where evicting one node at a time would need an order to
+// keep and a quiet device could be the one lost.
+const maxVouched = 1 << 16
+
 type throttle struct {
-	last  time.Time
-	timer *time.Timer // non-nil while a trailing push is scheduled
+	last      time.Time   // of the last alert
+	lastQuiet time.Time   // of the last background push
+	timer     *time.Timer // non-nil while a trailing alert is scheduled
 }
 
-// idle is whether the entry can go: no trailing push pending, and its last push older than the window.
+// idle is whether the entry can go: no trailing push pending, and its last pushes older than the window.
 func (t *throttle) idle(now time.Time, window time.Duration) bool {
-	return t.timer == nil && now.Sub(t.last) > window
+	return t.timer == nil && now.Sub(t.last) > window && now.Sub(t.lastQuiet) > window
 }
 
 func (r *relay) handle(st stanza) {
@@ -302,15 +314,36 @@ func (r *relay) publish(st stanza) {
 		return
 	}
 
-	r.metrics.publishSummary(summaryKind(ps.Publish.Summary))
+	kind := summaryKind(ps.Publish.Summary)
+	r.metrics.publishSummary(kind)
 	node := ps.Publish.Node
+	if kind == "body" {
+		r.vouch(node)
+	}
+	// A summary without a body is only unimportant if the node's server marks important stanzas, which it proved
+	// by sending a body: Prosody with push_notification_important_body empty, or a server that leaves the body out
+	// for privacy, sends every message and call that way. Until then it alerts, which fails loud after a restart.
+	// ejabberd sends no form at all for what has no body, calls included, so that has to keep alerting too.
+	if kind == "no_body" && r.isVouched(node) {
+		if !r.scheduleBackground(node) {
+			r.metrics.publish("background_coalesced")
+			r.reply(st, nil)
+			return
+		}
+		if e := r.pushed(node, reg, false, true); e != nil {
+			r.reply(st, e)
+			return
+		}
+		r.reply(st, nil)
+		return
+	}
 	if !r.schedule(node, reg) {
 		// A push is already on its way, or comes at the window's end; that one is counted when it goes out.
 		r.metrics.publish("coalesced")
 		r.reply(st, nil)
 		return
 	}
-	if e := r.pushed(node, reg, false); e != nil {
+	if e := r.pushed(node, reg, false, false); e != nil {
 		r.reply(st, e)
 		return
 	}
@@ -334,15 +367,18 @@ func summaryKind(form *dataForm) string {
 // pushed pushes for reg, counts and logs how it went, and returns the reply for the publish behind it. A dead
 // token is dropped from the throttle: a trailing push has no publish to answer, so the server's next publish is
 // pushed at once and gets the item-not-found.
-func (r *relay) pushed(node string, reg registration, trailing bool) *stanzaError {
+func (r *relay) pushed(node string, reg registration, trailing, background bool) *stanzaError {
 	defer r.finished()
 	log := slog.With("sandbox", reg.Sandbox)
 	if trailing {
 		log = log.With("trailing", true)
 	}
+	if background {
+		log = log.With("background", true)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	err := r.apns.push(ctx, reg)
+	err := r.apns.push(ctx, reg, background)
 	var refused *pushError
 	outcome := ""
 	if errors.As(err, &refused) {
@@ -350,9 +386,12 @@ func (r *relay) pushed(node string, reg registration, trailing bool) *stanzaErro
 	}
 	switch {
 	case err == nil:
-		if trailing {
+		switch {
+		case trailing:
 			r.metrics.publish("trailing")
-		} else {
+		case background:
+			r.metrics.publish("background")
+		default:
 			r.metrics.publish("sent")
 		}
 		log.Info("pushed")
@@ -424,15 +463,7 @@ func (r *relay) schedule(node string, reg registration) (now bool) {
 		r.recent = map[string]*throttle{}
 	}
 	at := time.Now()
-	// Dropping the idle entries takes a pass over all of them: once a window is often enough.
-	if at.Sub(r.lastSweep) > r.window {
-		r.lastSweep = at
-		for n, t := range r.recent {
-			if t.idle(at, r.window) {
-				delete(r.recent, n)
-			}
-		}
-	}
+	r.sweep(at)
 	t := r.recent[node]
 	if t != nil && t.timer != nil {
 		return false
@@ -450,16 +481,79 @@ func (r *relay) schedule(node string, reg registration) (now bool) {
 		r.mu.Lock()
 		t.last, t.timer = time.Now(), nil
 		r.mu.Unlock()
-		r.pushed(node, reg, true)
+		r.pushed(node, reg, true, false)
 	})
 	return false
 }
 
-// forget drops node from the throttle. A trailing push scheduled meanwhile keeps its entry: it gets the same
+// vouch records that node's server sent a body publish. It lives apart from the throttle, whose entries are swept.
+func (r *relay) vouch(node string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.vouched[node] {
+		return
+	}
+	limit := cmp.Or(r.vouchedLimit, maxVouched)
+	if r.vouched == nil || len(r.vouched) >= limit {
+		r.vouched = map[string]bool{}
+	}
+	r.vouched[node] = true
+}
+
+func (r *relay) isVouched(node string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.vouched[node]
+}
+
+// sweep drops the idle entries. It takes a pass over all of them: once a window is often enough. The caller
+// holds mu.
+func (r *relay) sweep(at time.Time) {
+	if at.Sub(r.lastSweep) <= r.window {
+		return
+	}
+	r.lastSweep = at
+	for n, t := range r.recent {
+		if t.idle(at, r.window) {
+			delete(r.recent, n)
+		}
+	}
+}
+
+// scheduleBackground decides whether a background push to node goes out now (true), at most one per window.
+// The others are dropped, with no trailing push. It ignores the alert window and a trailing alert, and leaves
+// them alone. A push it promises counts as busy until pushed finishes it.
+func (r *relay) scheduleBackground(node string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.window <= 0 {
+		r.busy++
+		return true
+	}
+	if r.recent == nil {
+		r.recent = map[string]*throttle{}
+	}
+	at := time.Now()
+	r.sweep(at)
+	t := r.recent[node]
+	if t == nil {
+		t = &throttle{}
+		r.recent[node] = t
+	}
+	if at.Sub(t.lastQuiet) < r.window {
+		return false
+	}
+	t.lastQuiet = at
+	r.busy++
+	return true
+}
+
+// forget drops node from the throttle, and from the nodes known to send bodies. A trailing push scheduled meanwhile keeps its entry: it gets the same
 // answer and drops it then.
 func (r *relay) forget(node string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	delete(r.vouched, node)
 	if t := r.recent[node]; t != nil && t.timer == nil {
 		delete(r.recent, node)
 	}

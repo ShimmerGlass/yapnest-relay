@@ -191,7 +191,21 @@ func (s *fakeServer) exchange(iq string) stanza {
 }
 
 // publishXML is the pubsub payload of a push notification to node, with a summary that must stay out of the push.
-func publishXML(node string) string {
+func publishXML(node string) string { return publishXMLKind(node, "body") }
+
+// publishXMLKind is publishXML with the summary of a kind summaryKind knows: a form with a body, a form without
+// one, or no form.
+func publishXMLKind(node, kind string) string {
+	switch kind {
+	case "no_body":
+		return fmt.Sprintf(`<pubsub xmlns='%s'><publish node='%s'><item><notification xmlns='%s'><x xmlns='%s'>
+			<field var='FORM_TYPE'><value>urn:xmpp:push:summary</value></field>
+			<field var='message-count'><value>1</value></field>
+			</x></notification></item></publish></pubsub>`, nsPubsub, node, nsPush, nsData)
+	case "none":
+		return fmt.Sprintf(`<pubsub xmlns='%s'><publish node='%s'><item><notification xmlns='%s'/></item></publish></pubsub>`,
+			nsPubsub, node, nsPush)
+	}
 	return fmt.Sprintf(`<pubsub xmlns='%s'><publish node='%s'><item>
 		<notification xmlns='%s'><x xmlns='%s'>
 		<field var='FORM_TYPE'><value>urn:xmpp:push:summary</value></field>
@@ -487,7 +501,7 @@ func TestAPNsFailures(t *testing.T) {
 		fake.mu.Lock()
 		fake.status, fake.reason = c.status, c.reason
 		fake.mu.Unlock()
-		if err := a.push(context.Background(), registration{Token: testToken}); err == nil {
+		if err := a.push(context.Background(), registration{Token: testToken}, false); err == nil {
 			t.Fatalf("%s: no error", c.reason)
 		}
 		seen[c.outcome]++
@@ -496,7 +510,7 @@ func TestAPNsFailures(t *testing.T) {
 
 	// Nothing answers: a network error, still timed.
 	srv.Close()
-	err := a.push(context.Background(), registration{Token: testToken, Sandbox: true})
+	err := a.push(context.Background(), registration{Token: testToken, Sandbox: true}, false)
 	if err == nil {
 		t.Fatal("no error without a server")
 	}
@@ -600,14 +614,17 @@ func poll(timeout time.Duration, done func() bool) bool {
 type countingPusher struct {
 	mu    sync.Mutex
 	count int
+	// background is whether each push was a background one, in order.
+	background []bool
 	// fail, when set, is asked for the error of each push, given its number from 1.
 	fail func(n int) error
 }
 
-func (p *countingPusher) push(context.Context, registration) error {
+func (p *countingPusher) push(_ context.Context, _ registration, background bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.count++
+	p.background = append(p.background, background)
 	if p.fail != nil {
 		return p.fail(p.count)
 	}
@@ -683,18 +700,30 @@ func (b *syncBuffer) String() string {
 // throttledRelay is a relay that pushes through pusher at most once per window. publish publishes to one node and
 // returns the reply.
 func throttledRelay(t *testing.T, pusher pusher, window time.Duration) (r *relay, reg *prometheus.Registry, publish func() string) {
+	r, reg, publishKind := throttledRelayKinds(t, pusher, window)
+	return r, reg, func() string { return publishKind("body") }
+}
+
+// throttledRelayKinds is throttledRelay with a publish that takes the kind of summary to send. The kind "vouch"
+// only marks the node as having sent a body: a background push needs that, and a body publish would alert.
+func throttledRelayKinds(t *testing.T, pusher pusher, window time.Duration) (r *relay, reg *prometheus.Registry, publish func(kind string) string) {
 	s := testSealer(t)
 	node, _ := s.seal(registration{Token: testToken, Owner: "alice@example.org"})
 	var mu sync.Mutex
 	var replies []string
 	r = &relay{domain: "push.example", nodes: s, apns: pusher, window: window, metrics: newMetrics(),
 		send: func(x string) error { mu.Lock(); replies = append(replies, x); mu.Unlock(); return nil }}
-	publish = func() string {
+	publish = func(kind string) string {
+		if kind == "vouch" {
+			// As if the node had sent a body, without the alert and window that would come with it.
+			r.vouch(node)
+			return ""
+		}
 		mu.Lock()
 		before := len(replies)
 		mu.Unlock()
 		r.handle(stanza{XMLName: xml.Name{Local: "iq"}, Type: "set", ID: "p", From: "example.org", To: "push.example",
-			Inner: []byte(publishXML(node))})
+			Inner: []byte(publishXMLKind(node, kind))})
 		mu.Lock()
 		defer mu.Unlock()
 		// Publishes may run side by side: each one adds its own reply.
@@ -934,5 +963,244 @@ func TestPublishSummariesAreCountedByWhatTheyHave(t *testing.T) {
 		if got := publish(test.notification); got != test.want {
 			t.Errorf("%s: %q, not %q", name, got, test.want)
 		}
+	}
+}
+
+// Only a summary with a form but no body is quiet: ejabberd sends no form for calls, which must still ring.
+func TestPublishKindsChooseThePushType(t *testing.T) {
+	for kind, want := range map[string]bool{"body": false, "none": false, "no_body": true} {
+		pusher := &countingPusher{}
+		_, reg, publish := throttledRelayKinds(t, pusher, time.Minute)
+		publish("vouch")
+		publish(kind)
+		if len(pusher.background) != 1 || pusher.background[0] != want {
+			t.Errorf("%s: background pushes %v, want %v", kind, pusher.background, want)
+		}
+		sent, background := 1.0, 0.0
+		if want {
+			sent, background = 0, 1
+		}
+		expect(t, reg, sent, "yapnest_relay_publishes_total", "result", "sent")
+		expect(t, reg, background, "yapnest_relay_publishes_total", "result", "background")
+	}
+}
+
+// A call that follows presence is pushed at once: the presence neither opens an alert window nor makes the alert wait.
+func TestBackgroundDoesNotOpenAnAlertWindow(t *testing.T) {
+	pusher := &countingPusher{}
+	r, reg, publish := throttledRelayKinds(t, pusher, time.Minute)
+	publish("vouch")
+	publish("no_body")
+	publish("none")
+	if got := pusher.background; len(got) != 2 || !got[0] || got[1] {
+		t.Fatalf("pushes %v: the alert should follow at once", got)
+	}
+	// The alert opened its window, so the next one waits for its end.
+	publish("body")
+	expect(t, reg, 1, "yapnest_relay_publishes_total", "result", "coalesced")
+	if !drainWithin(r, 5*time.Second) {
+		t.Fatal("drain didn't finish")
+	}
+	if got := pusher.pushes(); got != 3 {
+		t.Fatalf("%d pushes, want the background, the alert and its trailing one", got)
+	}
+}
+
+// A background publish inside an alert window is pushed on its own, doesn't join the trailing alert and doesn't
+// schedule one.
+func TestBackgroundIgnoresTheAlertWindow(t *testing.T) {
+	pusher := &countingPusher{}
+	r, reg, publish := throttledRelayKinds(t, pusher, time.Minute)
+	publish("vouch")
+	publish("body")
+	publish("no_body")
+	if got := pusher.background; len(got) != 2 || got[0] || !got[1] {
+		t.Fatalf("pushes %v", got)
+	}
+	expect(t, reg, 0, "yapnest_relay_publishes_total", "result", "coalesced")
+	if !drainWithin(r, 5*time.Second) {
+		t.Fatal("drain didn't finish")
+	}
+	if got := pusher.pushes(); got != 2 {
+		t.Fatalf("%d pushes: a trailing alert was scheduled", got)
+	}
+	expect(t, reg, 0, "yapnest_relay_publishes_total", "result", "trailing")
+
+	// A trailing alert that is pending isn't a reason to drop a background push either, nor does it take its place.
+	pusher = &countingPusher{}
+	r, _, publish = throttledRelayKinds(t, pusher, time.Minute)
+	publish("vouch")
+	publish("body")
+	publish("body")
+	publish("no_body")
+	if got := pusher.background; len(got) != 2 || !got[1] {
+		t.Fatalf("pushes %v", got)
+	}
+	drainWithin(r, 5*time.Second)
+	if got := pusher.pushes(); got != 3 {
+		t.Fatalf("%d pushes, want the alert, the background one and the trailing alert", got)
+	}
+}
+
+// Background pushes get one per window and the rest are dropped with no trailing push; the device is only throttled
+// as long as that window lasts.
+func TestBackgroundIsLimitedPerWindow(t *testing.T) {
+	pusher := &countingPusher{}
+	r, reg, publish := throttledRelayKinds(t, pusher, 200*time.Millisecond)
+	publish("vouch")
+	r.metrics.trackThrottle(r)
+	for range 3 {
+		if reply := publish("no_body"); !strings.Contains(reply, "type=\"result\"") {
+			t.Errorf("reply %s", reply)
+		}
+	}
+	if got := pusher.pushes(); got != 1 {
+		t.Fatalf("%d pushes", got)
+	}
+	expect(t, reg, 1, "yapnest_relay_publishes_total", "result", "background")
+	expect(t, reg, 2, "yapnest_relay_publishes_total", "result", "background_coalesced")
+	expect(t, reg, 1, "yapnest_relay_throttled_devices")
+	waitFor(t, "the window to pass", func() bool { return r.throttled() == 0 })
+	if got := pusher.pushes(); got != 1 {
+		t.Fatalf("%d pushes: a dropped one was sent later", got)
+	}
+	publish("no_body")
+	if got := pusher.pushes(); got != 2 {
+		t.Fatalf("%d pushes after a quiet window", got)
+	}
+}
+
+// Idle entries are swept whichever kind of push made them.
+func TestBackgroundEntriesAreSwept(t *testing.T) {
+	pusher := &countingPusher{}
+	r, _, publish := throttledRelayKinds(t, pusher, 50*time.Millisecond)
+	publish("vouch")
+	publish("no_body")
+	waitFor(t, "the window to pass", func() bool { return r.throttled() == 0 })
+	publish("body")
+	r.mu.Lock()
+	n := len(r.recent)
+	r.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d entries", n)
+	}
+}
+
+// A dead token found by a background push is answered and forgotten like one found by an alert.
+func TestBackgroundGone(t *testing.T) {
+	pusher := &countingPusher{fail: func(int) error { return &pushError{Status: http.StatusGone, Reason: "Unregistered"} }}
+	r, reg, publish := throttledRelayKinds(t, pusher, time.Minute)
+	publish("vouch")
+	if got := publish("no_body"); !strings.Contains(got, "item-not-found") {
+		t.Fatalf("reply %s", got)
+	}
+	expect(t, reg, 1, "yapnest_relay_publishes_total", "result", "gone")
+	expect(t, reg, 0, "yapnest_relay_publishes_total", "result", "background")
+	if got := r.throttled(); got != 0 {
+		t.Fatalf("%v devices still throttled", got)
+	}
+	// Forgotten, so the next background push goes out instead of being dropped.
+	publish("no_body")
+	if got := pusher.pushes(); got != 2 {
+		t.Fatalf("%d pushes", got)
+	}
+}
+
+// Shutting down doesn't wait for background pushes that were dropped, and waits for one on its way.
+func TestDrainWithBackgroundPushes(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	pusher := &countingPusher{fail: func(int) error {
+		close(started)
+		<-release
+		return nil
+	}}
+	r, _, publish := throttledRelayKinds(t, pusher, time.Minute)
+	publish("vouch")
+	go publish("no_body")
+	<-started
+	publish("no_body")
+	drained := make(chan bool)
+	go func() { drained <- drainWithin(r, 5*time.Second) }()
+	select {
+	case <-drained:
+		t.Fatal("drain didn't wait for the push")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if !<-drained {
+		t.Fatal("drain didn't end with the push")
+	}
+}
+
+// A server whose summaries never have a body may mean every message by it, so its node alerts until it has sent a
+// body, and can get a trailing alert.
+func TestNoBodyAlertsUntilTheNodeSentABody(t *testing.T) {
+	pusher := &countingPusher{}
+	r, reg, publish := throttledRelayKinds(t, pusher, time.Minute)
+	publish("no_body")
+	publish("no_body")
+	if got := pusher.background; len(got) != 1 || got[0] {
+		t.Fatalf("pushes %v: the first should be an alert", got)
+	}
+	expect(t, reg, 1, "yapnest_relay_publishes_total", "result", "sent")
+	expect(t, reg, 1, "yapnest_relay_publishes_total", "result", "coalesced")
+	drainWithin(r, 5*time.Second)
+	if got := pusher.background; len(got) != 2 || got[1] {
+		t.Fatalf("pushes %v: the second should be a trailing alert", got)
+	}
+	expect(t, reg, 0, "yapnest_relay_publishes_total", "result", "background")
+
+	// A body from the node proves its server tells important from unimportant.
+	pusher = &countingPusher{}
+	_, _, publish = throttledRelayKinds(t, pusher, 0)
+	publish("body")
+	publish("no_body")
+	if got := pusher.background; len(got) != 2 || got[0] || !got[1] {
+		t.Fatalf("pushes %v: no_body after a body should be background", got)
+	}
+}
+
+func TestOtherNodesBodyDoesNotCount(t *testing.T) {
+	pusher := &countingPusher{}
+	r, _, publish := throttledRelayKinds(t, pusher, time.Minute)
+	r.vouch("another node")
+	publish("no_body")
+	if got := pusher.background; len(got) != 1 || got[0] {
+		t.Fatalf("pushes %v", got)
+	}
+}
+
+// A fresh relay, a dead token and passing the cap all forget what a node proved, so it alerts again.
+func TestVouchingIsForgotten(t *testing.T) {
+	fresh, _, _ := throttledRelayKinds(t, &countingPusher{}, 0)
+	if fresh.isVouched("n") {
+		t.Fatal("a new relay vouches")
+	}
+	fresh.vouch("n")
+	fresh.forget("n")
+	if fresh.isVouched("n") {
+		t.Fatal("forget kept the node")
+	}
+
+	fresh.vouchedLimit = 2
+	fresh.vouch("a")
+	fresh.vouch("b")
+	fresh.vouch("c")
+	if fresh.isVouched("a") || fresh.isVouched("b") || !fresh.isVouched("c") {
+		t.Fatalf("past the cap: a %v b %v c %v", fresh.isVouched("a"), fresh.isVouched("b"), fresh.isVouched("c"))
+	}
+
+	pusher := &countingPusher{fail: func(n int) error {
+		if n == 2 {
+			return &pushError{Status: http.StatusGone, Reason: "Unregistered"}
+		}
+		return nil
+	}}
+	_, _, publish := throttledRelayKinds(t, pusher, 0)
+	publish("body")
+	publish("no_body")
+	publish("no_body")
+	if got := pusher.background; len(got) != 3 || got[0] || !got[1] || got[2] {
+		t.Fatalf("pushes %v: a dead token should make the next no_body alert", got)
 	}
 }

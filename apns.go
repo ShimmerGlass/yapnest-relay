@@ -97,12 +97,17 @@ func (e *pushError) outcome() string {
 // then replaces it. mutable-content is what wakes the extension.
 var alertPayload = []byte(`{"aps":{"alert":{"title":"Yapnest","body":"New message"},"sound":"default","mutable-content":1}}`)
 
-func (a *apns) push(ctx context.Context, r registration) error {
+// A background push has nothing to show: it only wakes the app itself, not the notification extension, for a
+// publish the server didn't think important.
+var backgroundPayload = []byte(`{"aps":{"content-available":1}}`)
+
+// push sends an alert, or with background a silent push that wakes the app without showing anything.
+func (a *apns) push(ctx context.Context, r registration, background bool) error {
 	token, err := a.providerToken()
 	if err != nil {
 		return err
 	}
-	err = a.send(ctx, r, token)
+	err = a.send(ctx, r, token, background)
 	var refused *pushError
 	if errors.As(err, &refused) && refused.Reason == "ExpiredProviderToken" {
 		// Sign a new one, unless another push already did, and try once more. InvalidProviderToken is not
@@ -116,28 +121,36 @@ func (a *apns) push(ctx context.Context, r registration) error {
 		if token, err = a.providerToken(); err != nil {
 			return err
 		}
-		err = a.send(ctx, r, token)
+		err = a.send(ctx, r, token, background)
 	}
 	return err
 }
 
 // send is one request to APNs, authenticated with the provider token.
-func (a *apns) send(ctx context.Context, r registration, token string) error {
+func (a *apns) send(ctx context.Context, r registration, token string, background bool) error {
 	env := r.environment()
 	base := a.production
 	if r.Sandbox {
 		base = a.sandbox
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/3/device/"+hex.EncodeToString(r.Token), bytes.NewReader(alertPayload))
+	payload, pushType, priority := alertPayload, "alert", "10"
+	// Apple keeps the latest alert for a phone that's offline, for a day.
+	expiration := time.Now().Add(24 * time.Hour).Unix()
+	if background {
+		// Apple requires priority 5 for a background push. It expires at once (0: tried once, never stored), as a
+		// wake for a phone that was offline has nothing to catch up on that a later push wouldn't, and a stored one
+		// would only be delivered late and count against the app's throttled background budget.
+		payload, pushType, priority, expiration = backgroundPayload, "background", "5", 0
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/3/device/"+hex.EncodeToString(r.Token), bytes.NewReader(payload))
 	if err != nil {
 		return withoutURL(err)
 	}
 	req.Header.Set("authorization", "bearer "+token)
 	req.Header.Set("apns-topic", a.topic)
-	req.Header.Set("apns-push-type", "alert")
-	req.Header.Set("apns-priority", "10")
-	// Apple keeps the latest alert for a phone that's offline, for a day.
-	req.Header.Set("apns-expiration", strconv.FormatInt(time.Now().Add(24*time.Hour).Unix(), 10))
+	req.Header.Set("apns-push-type", pushType)
+	req.Header.Set("apns-priority", priority)
+	req.Header.Set("apns-expiration", strconv.FormatInt(expiration, 10))
 
 	start := time.Now()
 	resp, err := a.client.Do(req)
