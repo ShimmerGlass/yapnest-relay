@@ -18,6 +18,11 @@ reaches it over s2s, whichever server they're on. Its source is at <https://gith
 Nothing about a message reaches Apple. The summary some servers include (sender, body) is dropped. The relay reads
 it only for whether it has a body and whether that body repeats the node's last one (see [Bursts](#bursts)).
 
+An alert for a publish with no summary at all carries `"noMessage":true` beside `aps`. ejabberd sends none for what
+has no body: a read marker, a reaction, a presence, a call. When the extension can't fetch (the server didn't answer
+in time), it shows nothing for those, where for an alert that may be a message it leaves the relay's "New message".
+A trailing push carries it only if every publish it stands for had no summary. That one bit is all Apple learns.
+
 ## Nodes
 
 The relay stores no registrations. A node is the registration sealed with `RELAY_KEY` (AES-GCM): the device token, the

@@ -27,7 +27,7 @@ func testAPNs(t *testing.T) (*apns, *fakeAPNs, *httptest.Server) {
 func TestExpiredProviderTokenIsRenewed(t *testing.T) {
 	a, fake, _ := testAPNs(t)
 	fake.answers = []fakeAnswer{{http.StatusForbidden, "ExpiredProviderToken"}}
-	if err := a.push(context.Background(), registration{Token: testToken}, false); err != nil {
+	if err := a.push(context.Background(), registration{Token: testToken}, false, false); err != nil {
 		t.Fatal(err)
 	}
 	fake.mu.Lock()
@@ -42,7 +42,7 @@ func TestInvalidProviderTokenIsKept(t *testing.T) {
 	a, fake, _ := testAPNs(t)
 	fake.answers = []fakeAnswer{{http.StatusForbidden, "InvalidProviderToken"}, {http.StatusForbidden, "InvalidProviderToken"}}
 	for range 2 {
-		if err := a.push(context.Background(), registration{Token: testToken}, false); err == nil {
+		if err := a.push(context.Background(), registration{Token: testToken}, false, false); err == nil {
 			t.Fatal("no error")
 		}
 	}
@@ -58,7 +58,7 @@ func TestInvalidProviderTokenIsKept(t *testing.T) {
 func TestPushTypes(t *testing.T) {
 	a, fake, _ := testAPNs(t)
 	for _, background := range []bool{false, true} {
-		if err := a.push(context.Background(), registration{Token: testToken}, background); err != nil {
+		if err := a.push(context.Background(), registration{Token: testToken}, background, false); err != nil {
 			t.Fatal(err)
 		}
 		fake.mu.Lock()
@@ -75,5 +75,22 @@ func TestPushTypes(t *testing.T) {
 		if got["type"] != "alert" || got["priority"] != "10" || got["expiration"] == "0" || !strings.Contains(got["body"], `"mutable-content":1`) {
 			t.Errorf("alert push %v", got)
 		}
+		if strings.Contains(got["body"], "noMessage") {
+			t.Errorf("an alert that may be a message says it isn't: %s", got["body"])
+		}
+	}
+}
+
+// An alert for a publish that announces no message says so, and is otherwise the same alert.
+func TestNoMessageAlert(t *testing.T) {
+	a, fake, _ := testAPNs(t)
+	if err := a.push(context.Background(), registration{Token: testToken}, false, true); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	body, kind := fake.body, fake.header.Get("apns-push-type")
+	fake.mu.Unlock()
+	if kind != "alert" || !strings.Contains(body, `"noMessage":true`) || !strings.Contains(body, `"mutable-content":1`) {
+		t.Errorf("no-message alert %s %s", kind, body)
 	}
 }

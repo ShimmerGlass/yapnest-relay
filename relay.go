@@ -35,7 +35,7 @@ const (
 )
 
 type pusher interface {
-	push(ctx context.Context, reg registration, background bool) error
+	push(ctx context.Context, reg registration, background, noMessage bool) error
 }
 
 // relay is the XEP-0357 app server: devices register their APNs token and get a node back, then hand the node
@@ -89,6 +89,8 @@ type throttle struct {
 	last      time.Time   // of the last alert
 	lastQuiet time.Time   // of the last background push
 	timer     *time.Timer // non-nil while a trailing alert is scheduled
+	// mayBeMessage is whether a publish the trailing alert stands for may announce a message.
+	mayBeMessage bool
 }
 
 // idle is whether the entry can go: no trailing push pending, and its last pushes older than the window.
@@ -345,7 +347,7 @@ func (r *relay) publish(st stanza) {
 	if background {
 		now = r.scheduleBackground(node)
 	} else {
-		now = r.schedule(node, reg)
+		now = r.schedule(node, reg, kind != "none")
 	}
 	if !now {
 		// For an alert, a push is already on its way, or comes at the window's end; that one is counted when it
@@ -358,7 +360,7 @@ func (r *relay) publish(st stanza) {
 		r.reply(st, nil)
 		return
 	}
-	if e := r.pushed(node, reg, false, background); e != nil {
+	if e := r.pushed(node, reg, false, background, kind == "none"); e != nil {
 		r.reply(st, e)
 		return
 	}
@@ -393,7 +395,7 @@ func summaryBody(form *dataForm) string {
 // pushed pushes for reg, counts and logs how it went, and returns the reply for the publish behind it. A dead
 // token is dropped from the throttle: a trailing push has no publish to answer, so the server's next publish is
 // pushed at once and gets the item-not-found.
-func (r *relay) pushed(node string, reg registration, trailing, background bool) *stanzaError {
+func (r *relay) pushed(node string, reg registration, trailing, background, noMessage bool) *stanzaError {
 	defer r.finished()
 	log := slog.With("sandbox", reg.Sandbox)
 	if trailing {
@@ -404,7 +406,7 @@ func (r *relay) pushed(node string, reg registration, trailing, background bool)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	err := r.apns.push(ctx, reg, background)
+	err := r.apns.push(ctx, reg, background, noMessage)
 	var refused *pushError
 	outcome := ""
 	if errors.As(err, &refused) {
@@ -486,7 +488,7 @@ func (r *relay) drain(ctx context.Context) {
 // schedule decides whether a publish to node is pushed now (true). Otherwise a push to reg for the window's end
 // is scheduled, unless one already is; either way the publish is absorbed. Each push it promises counts as busy
 // until pushed finishes it.
-func (r *relay) schedule(node string, reg registration) (now bool) {
+func (r *relay) schedule(node string, reg registration, mayBeMessage bool) (now bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.window <= 0 {
@@ -500,6 +502,7 @@ func (r *relay) schedule(node string, reg registration) (now bool) {
 	r.sweep(at)
 	t := r.recent[node]
 	if t != nil && t.timer != nil {
+		t.mayBeMessage = t.mayBeMessage || mayBeMessage
 		return false
 	}
 	r.busy++
@@ -511,11 +514,13 @@ func (r *relay) schedule(node string, reg registration) (now bool) {
 		t.last = at
 		return true
 	}
+	t.mayBeMessage = mayBeMessage
 	t.timer = time.AfterFunc(t.last.Add(r.window).Sub(at), func() {
 		r.mu.Lock()
 		t.last, t.timer = time.Now(), nil
+		noMessage := !t.mayBeMessage
 		r.mu.Unlock()
-		r.pushed(node, reg, true, false)
+		r.pushed(node, reg, true, false, noMessage)
 	})
 	return false
 }

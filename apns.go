@@ -97,17 +97,23 @@ func (e *pushError) outcome() string {
 // then replaces it. mutable-content is what wakes the extension.
 var alertPayload = []byte(`{"aps":{"alert":{"title":"Yapnest","body":"New message"},"sound":"default","mutable-content":1}}`)
 
+// noMessagePayload is the alert for a publish whose summary says it announces no message: ejabberd sends none for
+// what has no body (a read marker, a reaction, a presence, a call). The extension shows nothing for it when it can't
+// fetch, where it would show "New message" for one that may be a message. Only that bit of the summary goes to Apple.
+var noMessagePayload = []byte(`{"aps":{"alert":{"title":"Yapnest","body":"New message"},"sound":"default","mutable-content":1},"noMessage":true}`)
+
 // A background push has nothing to show: it only wakes the app itself, not the notification extension, for a
 // publish the server didn't think important.
 var backgroundPayload = []byte(`{"aps":{"content-available":1}}`)
 
-// push sends an alert, or with background a silent push that wakes the app without showing anything.
-func (a *apns) push(ctx context.Context, r registration, background bool) error {
+// push sends an alert, or with background a silent push that wakes the app without showing anything. noMessage
+// marks an alert for a publish that announces no message (noMessagePayload).
+func (a *apns) push(ctx context.Context, r registration, background, noMessage bool) error {
 	token, err := a.providerToken()
 	if err != nil {
 		return err
 	}
-	err = a.send(ctx, r, token, background)
+	err = a.send(ctx, r, token, background, noMessage)
 	var refused *pushError
 	if errors.As(err, &refused) && refused.Reason == "ExpiredProviderToken" {
 		// Sign a new one, unless another push already did, and try once more. InvalidProviderToken is not
@@ -121,13 +127,13 @@ func (a *apns) push(ctx context.Context, r registration, background bool) error 
 		if token, err = a.providerToken(); err != nil {
 			return err
 		}
-		err = a.send(ctx, r, token, background)
+		err = a.send(ctx, r, token, background, noMessage)
 	}
 	return err
 }
 
 // send is one request to APNs, authenticated with the provider token.
-func (a *apns) send(ctx context.Context, r registration, token string, background bool) error {
+func (a *apns) send(ctx context.Context, r registration, token string, background, noMessage bool) error {
 	env := r.environment()
 	base := a.production
 	if r.Sandbox {
@@ -144,6 +150,9 @@ func (a *apns) send(ctx context.Context, r registration, token string, backgroun
 	} else {
 		// Apple keeps the latest alert for a phone that's offline, for a day.
 		payload, pushType, priority = alertPayload, "alert", "10"
+		if noMessage {
+			payload = noMessagePayload
+		}
 		expiration = time.Now().Add(24 * time.Hour).Unix()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/3/device/"+hex.EncodeToString(r.Token), bytes.NewReader(payload))

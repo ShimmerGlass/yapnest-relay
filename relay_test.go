@@ -507,7 +507,7 @@ func TestAPNsFailures(t *testing.T) {
 		fake.mu.Lock()
 		fake.status, fake.reason = c.status, c.reason
 		fake.mu.Unlock()
-		if err := a.push(context.Background(), registration{Token: testToken}, false); err == nil {
+		if err := a.push(context.Background(), registration{Token: testToken}, false, false); err == nil {
 			t.Fatalf("%s: no error", c.reason)
 		}
 		seen[c.outcome]++
@@ -516,7 +516,7 @@ func TestAPNsFailures(t *testing.T) {
 
 	// Nothing answers: a network error, still timed.
 	srv.Close()
-	err := a.push(context.Background(), registration{Token: testToken, Sandbox: true}, false)
+	err := a.push(context.Background(), registration{Token: testToken, Sandbox: true}, false, false)
 	if err == nil {
 		t.Fatal("no error without a server")
 	}
@@ -622,15 +622,18 @@ type countingPusher struct {
 	count int
 	// background is whether each push was a background one, in order.
 	background []bool
+	// noMessage is whether each push was marked as announcing no message, in order.
+	noMessage []bool
 	// fail, when set, is asked for the error of each push, given its number from 1.
 	fail func(n int) error
 }
 
-func (p *countingPusher) push(_ context.Context, _ registration, background bool) error {
+func (p *countingPusher) push(_ context.Context, _ registration, background, noMessage bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.count++
 	p.background = append(p.background, background)
+	p.noMessage = append(p.noMessage, noMessage)
 	if p.fail != nil {
 		return p.fail(p.count)
 	}
@@ -993,6 +996,48 @@ func TestPublishKindsChooseThePushType(t *testing.T) {
 		}
 		expect(t, reg, sent, "yapnest_relay_publishes_total", "result", "sent")
 		expect(t, reg, background, "yapnest_relay_publishes_total", "result", "background")
+	}
+}
+
+// Only a publish with no summary at all announces no message: ejabberd sends none for a read marker, a reaction or a
+// presence. A summary with or without a body may be a message, an OMEMO one whose fallback body was stripped.
+func TestOnlyAPublishWithoutASummaryIsMarkedAsNoMessage(t *testing.T) {
+	for kind, want := range map[string]bool{"body": false, "none": true, "no_body": false} {
+		pusher := &countingPusher{}
+		_, _, publish := throttledRelayKinds(t, pusher, 0)
+		publish(kind)
+		pusher.mu.Lock()
+		got := pusher.noMessage
+		pusher.mu.Unlock()
+		if len(got) != 1 || got[0] != want {
+			t.Errorf("%s: noMessage %v, want %v", kind, got, want)
+		}
+	}
+}
+
+// A trailing alert stands for every publish it absorbed, so one that may be a message makes it one that may be.
+func TestATrailingAlertMayBeAMessageIfAnyPublishItStandsForMayBe(t *testing.T) {
+	for name, test := range map[string]struct {
+		kinds []string
+		want  bool
+	}{
+		"only markers":         {[]string{"none", "none", "none"}, true},
+		"a message among them": {[]string{"none", "body", "none"}, false},
+	} {
+		pusher := &countingPusher{}
+		r, _, publish := throttledRelayKinds(t, pusher, 200*time.Millisecond)
+		for _, kind := range test.kinds {
+			publish(kind)
+		}
+		if !drainWithin(r, 5*time.Second) {
+			t.Fatalf("%s: drain didn't finish", name)
+		}
+		pusher.mu.Lock()
+		got := pusher.noMessage
+		pusher.mu.Unlock()
+		if len(got) != 2 || got[1] != test.want {
+			t.Errorf("%s: noMessage %v, want the trailing one %v", name, got, test.want)
+		}
 	}
 }
 
