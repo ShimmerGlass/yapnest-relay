@@ -35,6 +35,13 @@ type sealer struct {
 
 const nodeVersion = 1
 
+// APNs device tokens are 32 bytes today, and Apple says their length may change, so the bounds leave room. Anything
+// else is no token, and refusing it keeps one account from registering endless nodes for garbage.
+const (
+	minDeviceToken = 32
+	maxDeviceToken = 100
+)
+
 func newSealer(key []byte) (*sealer, error) {
 	if len(key) < 32 {
 		return nil, errors.New("the relay key needs at least 32 bytes")
@@ -57,7 +64,7 @@ func subkey(key []byte, purpose string) []byte {
 }
 
 func (s *sealer) seal(r registration) (string, error) {
-	if len(r.Token) == 0 || len(r.Token) > 255 {
+	if len(r.Token) < minDeviceToken || len(r.Token) > maxDeviceToken {
 		return "", errors.New("bad device token length")
 	}
 	env := byte(0)

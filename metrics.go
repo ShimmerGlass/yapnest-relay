@@ -150,7 +150,7 @@ func (m *metrics) trackThrottle(r *relay) {
 	}
 	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "yapnest_relay_throttled_devices",
-		Help: "Devices inside their push window or with a trailing push pending.",
+		Help: "Devices inside their push window (alert or background) or with a trailing push pending.",
 	}, r.throttled))
 }
 

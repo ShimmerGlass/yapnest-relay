@@ -133,14 +133,18 @@ func (a *apns) send(ctx context.Context, r registration, token string, backgroun
 	if r.Sandbox {
 		base = a.sandbox
 	}
-	payload, pushType, priority := alertPayload, "alert", "10"
-	// Apple keeps the latest alert for a phone that's offline, for a day.
-	expiration := time.Now().Add(24 * time.Hour).Unix()
+	var payload []byte
+	var pushType, priority string
+	var expiration int64
 	if background {
 		// Apple requires priority 5 for a background push. It expires at once (0: tried once, never stored), as a
 		// wake for a phone that was offline has nothing to catch up on that a later push wouldn't, and a stored one
 		// would only be delivered late and count against the app's throttled background budget.
 		payload, pushType, priority, expiration = backgroundPayload, "background", "5", 0
+	} else {
+		// Apple keeps the latest alert for a phone that's offline, for a day.
+		payload, pushType, priority = alertPayload, "alert", "10"
+		expiration = time.Now().Add(24 * time.Hour).Unix()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/3/device/"+hex.EncodeToString(r.Token), bytes.NewReader(payload))
 	if err != nil {

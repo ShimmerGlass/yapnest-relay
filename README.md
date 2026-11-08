@@ -12,14 +12,15 @@ reaches it over s2s, whichever server they're on. Its source is at <https://gith
    sends Apple a content-free alert with `mutable-content`. That wakes the app's notification service extension,
    which fetches the message, decrypts it and shows it. Prosody marks what it doesn't count as important
    (presence, receipts, chat states) with a summary that has no body: those get a silent background push
-   (`content-available`, no alert) instead, so they don't show a notification, but only once that node has published a
-   summary with a body since the relay started (see [Bursts](#bursts)).
+   (`content-available`, no alert) instead, so they don't show a notification, but only once that node's server has
+   been seen to send a fixed placeholder body (see [Bursts](#bursts)).
 
-Nothing about a message reaches Apple. The summary some servers include (sender, body) is dropped.
+Nothing about a message reaches Apple. The summary some servers include (sender, body) is dropped. The relay reads
+it only for whether it has a body and whether that body repeats the node's last one (see [Bursts](#bursts)).
 
 ## Nodes
 
-The relay keeps no state. A node is the registration sealed with `RELAY_KEY` (AES-GCM): the device token, the
+The relay stores no registrations. A node is the registration sealed with `RELAY_KEY` (AES-GCM): the device token, the
 environment (sandbox or production) and the bare JID that registered it.
 
 - **The user's server never sees the device token.**
@@ -42,10 +43,21 @@ pushed at once. A device gets at most one background push per window; the others
 push, as nothing urgent is in them and iOS throttles them anyway. They expire at once rather than being kept for
 an offline phone. Only a summary with a form but no body is quiet: ejabberd sends no form for anything without a
 body, calls included, so those keep alerting. Even then, a node's bodiless publish stays an alert, with its window
-and trailing push, until that node has sent one with a body since the relay started. That proves its server
-marks important stanzas: Prosody with `push_notification_important_body` empty, or a server that leaves the body
-out for privacy, sends every message and call without one. The relay remembers this in memory only, for a bounded
-number of nodes and forgets all of it past that, so after a restart devices alert until their first real message.
+and trailing push, until the relay has seen that node's server send the same body twice since it started. That
+proves its server puts a fixed placeholder on important stanzas, as Prosody's default does (`New Message!`,
+`push_notification_important_body`), so one without a body is unimportant. A server that sends real bodies
+(Prosody with `push_notification_with_body`) or none doesn't qualify: its important stanzas can come without a
+body (an OMEMO message, a call), so a node whose body ever differs from its last is never sent background pushes
+until the relay restarts. In practice only Prosody with its default settings gets them.
+
+To do this the relay keeps, for each node, a keyed hash of its last body (the key is random and per process) and
+two flags, in memory only: never written down, never logged, and not reversible to the text. It holds that for a
+bounded number of nodes and evicts the oldest past that, so no one can flush the others'. A node is forgotten
+when APNs refuses its token. The state is per process, so the relay assumes a single replica, and after a restart
+devices alert until their server has sent its placeholder twice. Registration accepts tokens of 32 to 100 bytes:
+APNs tokens are 32 bytes today and Apple says their length may change.
+
+A background push that APNs refused doesn't count against the window.
 
 Changing `RELAY_KEY` invalidates every node. Apps register on every launch, so they recover on their own.
 
@@ -84,7 +96,8 @@ Store get production ones.
 ## Metrics
 
 With `RELAY_METRICS_ADDR` set, the relay serves Prometheus metrics on that address, apart from anything XMPP.
-Unset, it opens no listener. Each replica has its own numbers: scrape both and sum them.
+Unset, it opens no listener. The relay runs as a single replica (the throttle and what it knows of each node's
+bodies are in memory), so there is one set of numbers to scrape.
 
 - `/metrics`: the metrics below.
 - `/healthz`: 200 while the component is connected to the XMPP server, 503 otherwise.
@@ -93,7 +106,7 @@ Unset, it opens no listener. Each replica has its own numbers: scrape both and s
 |---|---|---|
 | `yapnest_relay_registrations_total` | `environment` (`sandbox`, `production`, `unknown` when the form named none of them), `result` (`ok`, `bad_token`, `bad_form`) | registrations |
 | `yapnest_relay_publishes_total` | `result` (see below) | publishes from users' servers |
-| `yapnest_relay_publish_summaries_total` | `summary` (`body`, `no_body` for a form without one, `none` for no form) | publishes from the node's owner by what their summary has; only whether there is a body is read |
+| `yapnest_relay_publish_summaries_total` | `summary` (`body`, `no_body` for a form without one, `none` for no form) | publishes from the node's owner by what their summary has; only whether there is a body is counted |
 | `yapnest_relay_apns_requests_total` | `environment`, `outcome` (`ok`, `bad_request`, `forbidden`, `gone`, `too_many`, `server_error`, `network_error`) | requests to APNs. A dead token is `gone`, whichever status Apple used |
 | `yapnest_relay_apns_request_duration_seconds` | `environment` | histogram of those requests, failed ones included |
 | `yapnest_relay_component_connected` | | 1 while connected, else 0 |

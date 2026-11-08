@@ -2,7 +2,11 @@ package main
 
 import (
 	"cmp"
+	"container/list"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
@@ -49,8 +53,12 @@ type relay struct {
 	mu        sync.Mutex
 	recent    map[string]*throttle // by node
 	lastSweep time.Time            // when recent last dropped its idle entries
-	vouched   map[string]bool      // nodes whose server has sent a body publish since the relay started
-	// vouchedLimit is how many nodes vouched holds; 0 for maxVouched.
+	// bodies is what the relay has seen of each node's summary bodies, oldest first in bodyOrder. A node is
+	// vouched once its server has sent the same body twice. Only a keyed hash of a body is kept.
+	bodies    map[string]*list.Element // of *bodyMark, by node
+	bodyOrder *list.List
+	bodyKey   []byte // keys the hashes; random per process, so nothing kept can be matched to a message
+	// vouchedLimit is how many nodes bodies holds; 0 for maxVouched.
 	vouchedLimit int
 	draining     bool          // drain has started: nothing waits for a window any more
 	busy         int           // the pushes schedule promised, at once or trailing, and not finished
@@ -65,10 +73,17 @@ const pushWindow = 10 * time.Second
 // A publish Prosody didn't count as important (presence, receipts, chat states) only needs the app to catch up,
 // quietly. Those pushes are limited apart from alerts, so they neither delay one (a call right after presence is
 // pushed at once) nor get a trailing push: nothing urgent is in them, and iOS throttles background pushes anyway.
-// maxVouched bounds the nodes remembered to have sent a body. Past it everything is forgotten, so devices alert
-// again until their next real message: that fails loud, where evicting one node at a time would need an order to
-// keep and a quiet device could be the one lost.
+// maxVouched bounds the nodes whose bodies are remembered. Past it the oldest is evicted, so that node alerts
+// again until it has been vouched anew: that fails loud, and no one can flush the others' state at once.
 const maxVouched = 1 << 16
+
+// bodyMark is what the relay remembers of a node's summary bodies.
+type bodyMark struct {
+	node    string
+	hash    [sha256.Size]byte // keyed hash of the last body
+	vouched bool              // the same body came twice: a fixed placeholder, not message text
+	real    bool              // a body differed from the one before: the server sends real text
+}
 
 type throttle struct {
 	last      time.Time   // of the last alert
@@ -285,8 +300,8 @@ func (r *relay) register(st stanza) {
 }
 
 // publish is a notification from a user's server: it becomes an alert on the device the node names. Of the
-// notification's summary (sender, body), only whether it has a body is looked at, to count it: none of it reaches
-// Apple.
+// notification's summary (sender, body), only whether it has a body, and whether it repeats the node's last one,
+// is looked at (see observeBody): none of it reaches Apple.
 func (r *relay) publish(st stanza) {
 	var ps struct {
 		Publish struct {
@@ -318,32 +333,32 @@ func (r *relay) publish(st stanza) {
 	r.metrics.publishSummary(kind)
 	node := ps.Publish.Node
 	if kind == "body" {
-		r.vouch(node)
+		r.observeBody(node, summaryBody(ps.Publish.Summary))
 	}
-	// A summary without a body is only unimportant if the node's server marks important stanzas, which it proved
-	// by sending a body: Prosody with push_notification_important_body empty, or a server that leaves the body out
-	// for privacy, sends every message and call that way. Until then it alerts, which fails loud after a restart.
+	// A summary without a body is only unimportant if the node's server puts a fixed placeholder on important
+	// stanzas, which it proved by sending the same body twice: Prosody's default dummy body. A server that sends
+	// real bodies, or none, leaves important stanzas (an OMEMO message whose fallback body is stripped, a call)
+	// without one, so those would be silent. Until then it alerts, which fails loud after a restart.
 	// ejabberd sends no form at all for what has no body, calls included, so that has to keep alerting too.
-	if kind == "no_body" && r.isVouched(node) {
-		if !r.scheduleBackground(node) {
+	background := kind == "no_body" && r.isVouched(node)
+	var now bool
+	if background {
+		now = r.scheduleBackground(node)
+	} else {
+		now = r.schedule(node, reg)
+	}
+	if !now {
+		// For an alert, a push is already on its way, or comes at the window's end; that one is counted when it
+		// goes out. A background push is simply dropped.
+		if background {
 			r.metrics.publish("background_coalesced")
-			r.reply(st, nil)
-			return
-		}
-		if e := r.pushed(node, reg, false, true); e != nil {
-			r.reply(st, e)
-			return
+		} else {
+			r.metrics.publish("coalesced")
 		}
 		r.reply(st, nil)
 		return
 	}
-	if !r.schedule(node, reg) {
-		// A push is already on its way, or comes at the window's end; that one is counted when it goes out.
-		r.metrics.publish("coalesced")
-		r.reply(st, nil)
-		return
-	}
-	if e := r.pushed(node, reg, false, false); e != nil {
+	if e := r.pushed(node, reg, false, background); e != nil {
 		r.reply(st, e)
 		return
 	}
@@ -356,12 +371,23 @@ func summaryKind(form *dataForm) string {
 	if form == nil {
 		return "none"
 	}
-	for _, field := range form.Fields {
-		if field.Var == "last-message-body" && len(field.Values) > 0 && field.Values[0] != "" {
-			return "body"
-		}
+	if summaryBody(form) != "" {
+		return "body"
 	}
 	return "no_body"
+}
+
+// summaryBody is the summary's last-message-body, empty if it has none.
+func summaryBody(form *dataForm) string {
+	if form == nil {
+		return ""
+	}
+	for _, field := range form.Fields {
+		if field.Var == "last-message-body" && len(field.Values) > 0 {
+			return field.Values[0]
+		}
+	}
+	return ""
 }
 
 // pushed pushes for reg, counts and logs how it went, and returns the reply for the publish behind it. A dead
@@ -384,6 +410,10 @@ func (r *relay) pushed(node string, reg registration, trailing, background bool)
 	if errors.As(err, &refused) {
 		outcome = refused.outcome()
 	}
+	if err != nil && background {
+		// A push that failed didn't wake the device, so it mustn't make the next one wait out the window.
+		r.refundBackground(node)
+	}
 	switch {
 	case err == nil:
 		switch {
@@ -402,6 +432,10 @@ func (r *relay) pushed(node string, reg registration, trailing, background bool)
 		log.Info("device gone", "reason", refused.Reason)
 		r.forget(node)
 		return stanzaErr("cancel", "item-not-found")
+	case outcome == "bad_request":
+		// The token isn't one APNs accepts, so what its node proved is worth nothing; the server isn't told, as
+		// this refusal may as well be the relay's own request.
+		r.forget(node)
 	case outcome == "too_many":
 		r.metrics.publish("error")
 		log.Warn("throttled by APNs")
@@ -486,24 +520,61 @@ func (r *relay) schedule(node string, reg registration) (now bool) {
 	return false
 }
 
-// vouch records that node's server sent a body publish. It lives apart from the throttle, whose entries are swept.
-func (r *relay) vouch(node string) {
+// observeBody records a body node's server sent. It lives apart from the throttle, whose entries are swept. The
+// first body is only remembered. The same one again vouches the node: Prosody puts a fixed placeholder on important
+// stanzas (push_notification_important_body), where a server that sends real bodies never repeats itself for long.
+// A body that differs from the last marks the node as sending real text, for good until the relay restarts.
+func (r *relay) observeBody(node, body string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.vouched[node] {
+	if r.bodyKey == nil {
+		r.bodyKey = make([]byte, 32)
+		if _, err := rand.Read(r.bodyKey); err != nil {
+			panic(err) // the system's randomness is gone
+		}
+	}
+	mac := hmac.New(sha256.New, r.bodyKey)
+	mac.Write([]byte(body))
+	var h [sha256.Size]byte
+	mac.Sum(h[:0])
+
+	if e := r.bodies[node]; e != nil {
+		m := e.Value.(*bodyMark)
+		switch {
+		case m.real:
+		case m.hash == h:
+			m.vouched = true
+		default:
+			m.vouched, m.real = false, true
+		}
+		m.hash = h
 		return
 	}
-	limit := cmp.Or(r.vouchedLimit, maxVouched)
-	if r.vouched == nil || len(r.vouched) >= limit {
-		r.vouched = map[string]bool{}
+	if r.bodies == nil {
+		r.bodies, r.bodyOrder = map[string]*list.Element{}, list.New()
 	}
-	r.vouched[node] = true
+	if len(r.bodies) >= cmp.Or(r.vouchedLimit, maxVouched) {
+		oldest := r.bodyOrder.Front()
+		delete(r.bodies, oldest.Value.(*bodyMark).node)
+		r.bodyOrder.Remove(oldest)
+	}
+	r.bodies[node] = r.bodyOrder.PushBack(&bodyMark{node: node, hash: h})
 }
 
 func (r *relay) isVouched(node string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.vouched[node]
+	e := r.bodies[node]
+	return e != nil && e.Value.(*bodyMark).vouched
+}
+
+// refundBackground makes a background push that failed not count against the node's window.
+func (r *relay) refundBackground(node string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if t := r.recent[node]; t != nil {
+		t.lastQuiet = time.Time{}
+	}
 }
 
 // sweep drops the idle entries. It takes a pass over all of them: once a window is often enough. The caller
@@ -548,12 +619,15 @@ func (r *relay) scheduleBackground(node string) bool {
 	return true
 }
 
-// forget drops node from the throttle, and from the nodes known to send bodies. A trailing push scheduled meanwhile keeps its entry: it gets the same
-// answer and drops it then.
+// forget drops node from the throttle, and what was seen of its bodies. A trailing push scheduled meanwhile keeps
+// its entry: it gets the same answer and drops it then.
 func (r *relay) forget(node string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.vouched, node)
+	if e := r.bodies[node]; e != nil {
+		delete(r.bodies, node)
+		r.bodyOrder.Remove(e)
+	}
 	if t := r.recent[node]; t != nil && t.timer == nil {
 		delete(r.recent, node)
 	}

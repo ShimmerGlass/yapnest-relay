@@ -196,6 +196,12 @@ func publishXML(node string) string { return publishXMLKind(node, "body") }
 // publishXMLKind is publishXML with the summary of a kind summaryKind knows: a form with a body, a form without
 // one, or no form.
 func publishXMLKind(node, kind string) string {
+	if text, ok := strings.CutPrefix(kind, "body:"); ok {
+		return fmt.Sprintf(`<pubsub xmlns='%s'><publish node='%s'><item>
+		<notification xmlns='%s'><x xmlns='%s'>
+		<field var='last-message-body'><value>%s</value></field>
+		</x></notification></item></publish></pubsub>`, nsPubsub, node, nsPush, nsData, text)
+	}
 	switch kind {
 	case "no_body":
 		return fmt.Sprintf(`<pubsub xmlns='%s'><publish node='%s'><item><notification xmlns='%s'><x xmlns='%s'>
@@ -716,8 +722,13 @@ func throttledRelayKinds(t *testing.T, pusher pusher, window time.Duration) (r *
 	publish = func(kind string) string {
 		if kind == "vouch" {
 			// As if the node had sent a body, without the alert and window that would come with it.
-			r.vouch(node)
+			r.observeBody(node, "New Message!")
+			r.observeBody(node, "New Message!")
 			return ""
+		}
+		if kind == "body" {
+			// The placeholder the vouching tests expect from a server like Prosody.
+			kind = "body:New Message!"
 		}
 		mu.Lock()
 		before := len(replies)
@@ -1155,52 +1166,149 @@ func TestNoBodyAlertsUntilTheNodeSentABody(t *testing.T) {
 	_, _, publish = throttledRelayKinds(t, pusher, 0)
 	publish("body")
 	publish("no_body")
-	if got := pusher.background; len(got) != 2 || got[0] || !got[1] {
-		t.Fatalf("pushes %v: no_body after a body should be background", got)
+	if got := pusher.background; len(got) != 2 || got[0] || got[1] {
+		t.Fatalf("pushes %v: one body doesn't make a placeholder", got)
+	}
+	publish("body")
+	publish("no_body")
+	if got := pusher.background; len(got) != 4 || !got[3] {
+		t.Fatalf("pushes %v: no_body after the same body twice should be background", got)
 	}
 }
 
 func TestOtherNodesBodyDoesNotCount(t *testing.T) {
 	pusher := &countingPusher{}
 	r, _, publish := throttledRelayKinds(t, pusher, time.Minute)
-	r.vouch("another node")
+	r.observeBody("another node", "New Message!")
+	r.observeBody("another node", "New Message!")
 	publish("no_body")
 	if got := pusher.background; len(got) != 1 || got[0] {
 		t.Fatalf("pushes %v", got)
 	}
 }
 
-// A fresh relay, a dead token and passing the cap all forget what a node proved, so it alerts again.
+// A fresh relay, a dead token and a refused one all forget what a node proved, so it alerts again; a full relay
+// evicts the oldest node only.
 func TestVouchingIsForgotten(t *testing.T) {
 	fresh, _, _ := throttledRelayKinds(t, &countingPusher{}, 0)
+	vouch := func(n string) { fresh.observeBody(n, "x"); fresh.observeBody(n, "x") }
 	if fresh.isVouched("n") {
 		t.Fatal("a new relay vouches")
 	}
-	fresh.vouch("n")
+	vouch("n")
 	fresh.forget("n")
 	if fresh.isVouched("n") {
 		t.Fatal("forget kept the node")
 	}
 
 	fresh.vouchedLimit = 2
-	fresh.vouch("a")
-	fresh.vouch("b")
-	fresh.vouch("c")
-	if fresh.isVouched("a") || fresh.isVouched("b") || !fresh.isVouched("c") {
+	vouch("a")
+	vouch("b")
+	vouch("c")
+	if fresh.isVouched("a") || !fresh.isVouched("b") || !fresh.isVouched("c") {
 		t.Fatalf("past the cap: a %v b %v c %v", fresh.isVouched("a"), fresh.isVouched("b"), fresh.isVouched("c"))
 	}
 
+	for name, fail := range map[string]error{
+		"gone":        &pushError{Status: http.StatusGone, Reason: "Unregistered"},
+		"bad request": &pushError{Status: http.StatusBadRequest, Reason: "BadTopic"},
+	} {
+		pusher := &countingPusher{fail: func(n int) error {
+			if n == 2 {
+				return fail
+			}
+			return nil
+		}}
+		_, _, publish := throttledRelayKinds(t, pusher, 0)
+		publish("vouch")
+		publish("no_body")
+		publish("no_body") // the second push fails
+		publish("no_body")
+		if got := pusher.background; len(got) != 3 || !got[0] || !got[1] || got[2] {
+			t.Fatalf("%s: pushes %v: the next no_body should alert", name, got)
+		}
+	}
+}
+
+// A server that sends real bodies never has a placeholder, so its bodiless publishes (an OMEMO message with its
+// fallback body stripped, a call) stay alerts, however many bodies it sends and even if one repeats later.
+func TestDifferingBodiesNeverVouch(t *testing.T) {
+	pusher := &countingPusher{}
+	_, _, publish := throttledRelayKinds(t, pusher, 0)
+	for _, kind := range []string{"body:hello", "body:hello", "body:how are you", "body:hello", "body:hello", "no_body"} {
+		publish(kind)
+	}
+	for i, background := range pusher.background {
+		if background {
+			t.Fatalf("pushes %v: push %d was silent", pusher.background, i)
+		}
+	}
+}
+
+func TestRepeatedPlaceholderVouches(t *testing.T) {
+	pusher := &countingPusher{}
+	_, _, publish := throttledRelayKinds(t, pusher, 0)
+	publish("body:New Message!")
+	publish("no_body")
+	publish("body:New Message!")
+	publish("no_body")
+	if got := pusher.background; len(got) != 4 || got[1] || !got[3] {
+		t.Fatalf("pushes %v: only the bodiless one after the second placeholder is silent", got)
+	}
+}
+
+// Filling the map with other nodes costs a node its place only when it is the oldest.
+func TestFloodingEvictsOnlyTheOldest(t *testing.T) {
+	r, _, _ := throttledRelayKinds(t, &countingPusher{}, 0)
+	r.vouchedLimit = 3
+	for _, n := range []string{"a", "b", "c", "d", "e"} {
+		r.observeBody(n, "x")
+		r.observeBody(n, "x")
+	}
+	for n, want := range map[string]bool{"a": false, "b": false, "c": true, "d": true, "e": true} {
+		if r.isVouched(n) != want {
+			t.Errorf("node %s vouched %v", n, !want)
+		}
+	}
+}
+
+// A body is kept only as a keyed hash.
+func TestBodiesAreNotKept(t *testing.T) {
+	r, _, _ := throttledRelayKinds(t, &countingPusher{}, 0)
+	r.observeBody("n", "the secret plan")
+	if m := r.bodies["n"].Value.(*bodyMark); m.hash == sha256.Sum256([]byte("the secret plan")) {
+		t.Fatal("the hash isn't keyed")
+	}
+}
+
+// A push that failed didn't wake the device, so the next bodiless publish isn't dropped for the window.
+func TestFailedBackgroundPushDoesNotChargeTheWindow(t *testing.T) {
 	pusher := &countingPusher{fail: func(n int) error {
-		if n == 2 {
-			return &pushError{Status: http.StatusGone, Reason: "Unregistered"}
+		if n == 1 {
+			return &pushError{Status: http.StatusInternalServerError, Reason: "InternalServerError"}
 		}
 		return nil
 	}}
-	_, _, publish := throttledRelayKinds(t, pusher, 0)
-	publish("body")
+	_, reg, publish := throttledRelayKinds(t, pusher, time.Minute)
+	publish("vouch")
+	if got := publish("no_body"); !strings.Contains(got, "type=\"error\"") {
+		t.Fatalf("reply %s", got)
+	}
 	publish("no_body")
-	publish("no_body")
-	if got := pusher.background; len(got) != 3 || got[0] || !got[1] || got[2] {
-		t.Fatalf("pushes %v: a dead token should make the next no_body alert", got)
+	if got := pusher.pushes(); got != 2 {
+		t.Fatalf("%d pushes: the retry was coalesced", got)
+	}
+	expect(t, reg, 1, "yapnest_relay_publishes_total", "result", "background")
+	expect(t, reg, 0, "yapnest_relay_publishes_total", "result", "background_coalesced")
+}
+
+// Only a token of a length APNs could use is registered: garbage would be an endless supply of nodes.
+func TestRegistrationRefusesImplausibleTokens(t *testing.T) {
+	s := testSealer(t)
+	for n, ok := range map[int]bool{0: false, 1: false, 31: false, 32: true, 100: true, 101: false, 255: false} {
+		_, err := s.seal(registration{Token: bytes.Repeat([]byte{1}, n), Owner: "a@b"})
+		if (err == nil) != ok {
+			t.Errorf("%d bytes: %v", n, err)
+		}
 	}
 }
